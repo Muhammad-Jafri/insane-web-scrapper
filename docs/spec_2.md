@@ -18,7 +18,7 @@
                                                     │
                                          ┌──────────▼──────────┐
                                          │   S3 / MinIO        │
-                                         │   (raw HTML blobs)  │
+                                         │  (HTML + images)    │
                                          └─────────────────────┘
 ```
 
@@ -198,8 +198,16 @@ is reconstructable from rows with `status = PENDING`.
 
 ### MinIO (local) / S3 (production)
 
-Workers upload raw HTML blobs after scraping. Postgres stores the object key, not the content.
+Workers upload two types of blobs after scraping. Postgres stores the object keys, not the content.
 MinIO is S3-compatible — swapping to real S3 requires only changing the endpoint URL.
+
+| Blob | Key pattern | Content-Type |
+|------|-------------|--------------|
+| Raw HTML | `html/{job_id}.html` | `text/html` |
+| Page images | `images/{job_id}/{n}.{ext}` | from response header |
+
+Images are capped at 20 per page. Data URLs (`data:image/...`) are skipped. If an individual
+image fetch fails it is silently skipped — the job does not fail because of a broken image.
 
 ---
 
@@ -280,7 +288,7 @@ GET /jobs/{job_id}
   "url": "...",
   "status": "DONE",
   "retries": 1,
-  "result": { "title": "...", "links": [...], "word_count": 1420 },
+  "result": { "title": "...", "links": [...], "word_count": 1420, "image_keys": ["images/..."] },
   "created_at": "...",
   "started_at": "...",
   "completed_at": "..."

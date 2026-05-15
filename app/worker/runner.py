@@ -23,7 +23,7 @@ from app.db.queries import (
 from app.worker.errors import FatalError, RetryableError
 from app.worker.fetch import fetch_url
 from app.worker.parse import parse_html
-from app.worker.storage import ensure_bucket, make_s3_client, upload_html
+from app.worker.storage import ensure_bucket, make_s3_client, upload_html, upload_images
 
 
 async def _delayed_reenqueue(
@@ -88,7 +88,11 @@ async def _coroutine_worker(
                 try:
                     html = await fetch_url(http_client, job["url"])
                     key = await upload_html(s3_client, html, job_id)
-                    data = parse_html(html)
+                    data = parse_html(html, job["url"])
+                    image_keys = await upload_images(
+                        s3_client, http_client, data.pop("image_urls"), job_id
+                    )
+                    data["image_keys"] = image_keys
                     await mark_job_done(pool, job_id, key, data)
                     await insert_job_event(pool, job_id, "completed", worker_id)
 
