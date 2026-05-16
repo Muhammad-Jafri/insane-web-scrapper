@@ -1,0 +1,261 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "title": "Active Jobs",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "scraper_active_jobs",
+          "legendFormat": "active"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "title": "Queue Depth",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "scraper_queue_depth",
+          "legendFormat": "depth"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "title": "Total Enqueued",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "scraper_jobs_enqueued_total",
+          "legendFormat": "enqueued"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "title": "Dead Jobs Total",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "scraper_jobs_total{status=\"dead\"}",
+          "legendFormat": "dead"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+      "fieldConfig": {
+        "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "id": 5,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "title": "Queue Depth Over Time",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "scraper_queue_depth",
+          "legendFormat": "depth"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "id": 6,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "title": "Job Rates (per second)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "rate(scraper_jobs_total{status=\"done\"}[2m])",
+          "legendFormat": "done"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "rate(scraper_jobs_total{status=\"retried\"}[2m])",
+          "legendFormat": "retried"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "rate(scraper_jobs_total{status=\"dead\"}[2m])",
+          "legendFormat": "dead"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "id": 7,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "title": "Fetch Duration",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "histogram_quantile(0.50, rate(scraper_fetch_duration_seconds_bucket[2m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "histogram_quantile(0.95, rate(scraper_fetch_duration_seconds_bucket[2m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "histogram_quantile(0.99, rate(scraper_fetch_duration_seconds_bucket[2m]))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "id": 8,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "title": "Job Duration",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "histogram_quantile(0.50, rate(scraper_job_duration_seconds_bucket[2m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "histogram_quantile(0.95, rate(scraper_job_duration_seconds_bucket[2m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "histogram_quantile(0.99, rate(scraper_job_duration_seconds_bucket[2m]))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "id": 9,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "title": "Domain Concurrency Wait (p95)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "scraper-prometheus" },
+          "expr": "histogram_quantile(0.95, rate(scraper_domain_wait_seconds_bucket[2m]))",
+          "legendFormat": "p95 wait"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["scraper"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Scraper",
+  "uid": "scraper-main",
+  "version": 1
+}

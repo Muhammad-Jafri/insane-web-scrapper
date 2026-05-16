@@ -404,12 +404,45 @@ Prometheus scrapes both every 15 seconds.
 | `scraper_queue_depth` | Gauge | Current Redis queue depth (polled every 15s) |
 | `scraper_active_jobs` | Gauge | Jobs currently being processed |
 
-Grafana datasource is auto-provisioned via
-`monitoring/grafana/provisioning/datasources/prometheus.yml`.
+Grafana datasource and dashboard are both auto-provisioned on container start via files in
+`monitoring/grafana/provisioning/`.
 
 **Note:** running multiple worker containers with the current static scrape target
 (`worker:9090`) means Prometheus only scrapes one worker (DNS round-robin). Docker SD
 is deferred — see phase 3.
+
+### Grafana dashboard — panels
+
+Dashboard uid: `scraper-main`. Auto-refreshes every 10s. Layout is a 24-column grid.
+
+**Row 1 — Overview stats (h=4)**
+
+| Panel | Type | Query |
+|-------|------|-------|
+| Active Jobs | Stat | `scraper_active_jobs` |
+| Queue Depth | Stat | `scraper_queue_depth` |
+| Total Enqueued | Stat | `scraper_jobs_enqueued_total` |
+| Dead Jobs Total | Stat (red threshold ≥1) | `scraper_jobs_total{status="dead"}` |
+
+**Row 2 — Queue & throughput (h=8)**
+
+| Panel | Type | Query |
+|-------|------|-------|
+| Queue Depth Over Time | Time series | `scraper_queue_depth` |
+| Job Rates (per second) | Time series | `rate(scraper_jobs_total{status=~"done\|retried\|dead"}[2m])` |
+
+**Row 3 — Latency (h=8)**
+
+| Panel | Type | Query |
+|-------|------|-------|
+| Fetch Duration | Time series | `histogram_quantile(0.5/0.95/0.99, rate(...bucket[2m]))` |
+| Job Duration | Time series | `histogram_quantile(0.5/0.95/0.99, rate(...bucket[2m]))` |
+
+**Row 4 — Domain concurrency (h=8)**
+
+| Panel | Type | Query |
+|-------|------|-------|
+| Domain Concurrency Wait (p95) | Time series | `histogram_quantile(0.95, rate(scraper_domain_wait_seconds_bucket[2m]))` |
 
 ---
 
