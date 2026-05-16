@@ -9,6 +9,15 @@ scrape_configs:
     metrics_path: /metrics
 
   - job_name: worker
-    static_configs:
-      - targets: ["worker:9090"]
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        filters:
+          - name: label
+            values: ["com.docker.compose.service=worker"]
+    relabel_configs:
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        regex: worker
+        action: keep
+      - source_labels: [__meta_docker_container_name]
+        target_label: instance
     metrics_path: /metrics

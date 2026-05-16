@@ -66,6 +66,10 @@ services:
     build: .
     command: python worker.py
     env_file: .env
+    expose:
+      - "9090"
+    deploy:
+      replicas: ${NUM_WORKERS:-1}
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,6 +87,7 @@ services:
       - "9091:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - api
       - worker

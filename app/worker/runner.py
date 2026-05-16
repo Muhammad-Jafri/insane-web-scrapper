@@ -1,6 +1,6 @@
 import asyncio
 import logging
-import os
+import socket
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -256,7 +256,7 @@ async def _queue_depth_poller(redis_client) -> None:
 async def run_worker() -> None:
     from prometheus_client import start_http_server
 
-    worker_id = f"worker-{os.getpid()}"
+    worker_id = socket.gethostname()
     pool = await create_pool()
     redis_client = aioredis.from_url(settings.redis_url)
     s3_client = make_s3_client()
