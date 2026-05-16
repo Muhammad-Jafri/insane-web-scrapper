@@ -76,9 +76,17 @@ coroutines happen to be waiting on the same domain, no new jobs get popped. This
 setting M high enough relative to your domain diversity, and addressed properly with priority
 queues in a later phase if needed.
 
-Domain semaphores are local (in-process) `asyncio.Semaphore` objects, keyed by hostname. For
-cross-process coordination (when running N worker processes), a Redis counter is added on top —
-the local semaphore acts as a fast first gate, the Redis counter as the global gate.
+Domain semaphores are local (in-process) `asyncio.Semaphore` objects, keyed by hostname.
+
+**Current implementation (phase 2):** only the local `asyncio.Semaphore` is in place. This works
+correctly with a single worker process. With N worker containers, each process has its own
+semaphore, so the effective per-domain concurrency becomes `N × MAX_CONCURRENCY_PER_DOMAIN`
+rather than the intended cap. Running `docker-compose up --scale worker=3` with a cap of 3 would
+allow 9 simultaneous requests to the same domain.
+
+**Planned (spec 3):** a Redis `INCR`/`DECR` counter with TTL will be added as a cross-process
+gate. The local semaphore remains as a fast in-process first check; the Redis counter enforces the
+global cap across all worker processes.
 
 ```python
 # per-process, per-domain
@@ -345,7 +353,7 @@ Fatal: 404, 403, malformed URL, unparseable HTML.
 | `QUEUE_DEPTH_LIMIT`         | `10000` | API rejects submissions above this |
 | `BRPOP_TIMEOUT`             | `5`     | Seconds a coroutine blocks waiting for work |
 | `FETCH_TIMEOUT`             | `15`    | HTTP request timeout in seconds |
-| `POSTGRES_DSN`              | —       | asyncpg connection string |
+| `DATABASE_URL`              | —       | asyncpg connection string |
 | `REDIS_URL`                 | —       | Redis connection string |
 | `S3_ENDPOINT_URL`           | —       | MinIO endpoint (omit for real AWS S3) |
 | `S3_BUCKET`                 | —       | Bucket name for raw HTML |
