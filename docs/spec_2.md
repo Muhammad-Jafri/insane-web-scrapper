@@ -381,5 +381,5 @@ then N when M hits diminishing returns (CPU-bound HTML parsing becomes the bottl
 |---|---|
 | 1 | docker-compose (Postgres + Redis + MinIO), DB schema, migrations |
 | 2 | Async worker — M coroutines, domain semaphore, basic retry, FastAPI routes |
-| 3 | Delayed retry queue (Redis `ZADD` sorted set by timestamp) |
+| 3 | Delayed retry queue (Redis `ZADD` sorted set by timestamp), Redis cross-process domain counter, `'retried'` job event |
 | 4 | Prometheus `/metrics`, queue depth alerts, worker heartbeat |
