@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 from app.config import settings
 from app.constants import QUEUE_KEY
 from app.db import queries as db
+from app.metrics import jobs_enqueued_total
 from app.models import (
     BulkJobCreate,
     BulkJobCreatedResponse,
@@ -35,6 +36,7 @@ async def submit_job(body: JobCreate, request: Request):
     await db.insert_job_event(pool, row["id"], "enqueued")
     await redis_client.rpush(QUEUE_KEY, str(row["id"]))
 
+    jobs_enqueued_total.inc()
     logger.info("job enqueued", extra={"job_id": str(row["id"]), "url": str(body.url)})
 
     return JobCreatedResponse(
@@ -63,6 +65,7 @@ async def submit_bulk(body: BulkJobCreate, request: Request):
     if job_ids:
         await redis_client.rpush(QUEUE_KEY, *[str(jid) for jid in job_ids])
 
+    jobs_enqueued_total.inc(len(job_ids))
     logger.info(
         "bulk enqueued",
         extra={"enqueued": len(job_ids), "rejected": rejected},

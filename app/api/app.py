@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI
+from prometheus_client import make_asgi_app
 
 from app.api.routes import health, jobs
 from app.config import settings
@@ -20,3 +21,4 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="insane-web-scrapper", lifespan=lifespan)
 app.include_router(jobs.router)
 app.include_router(health.router)
+app.mount("/metrics", make_asgi_app())

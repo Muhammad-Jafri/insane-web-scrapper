@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     queue_depth_limit: int = 10000
     brpop_timeout: int = 5
     fetch_timeout: int = 15
+    metrics_port: int = 9090
 
 
 settings = Settings()

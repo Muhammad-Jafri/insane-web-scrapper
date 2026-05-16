@@ -60,43 +60,42 @@ process (1 OS process):
 
 ---
 
-### 3. Domain semaphore — local asyncio.Semaphore, not re-enqueue
+### 3. Domain concurrency — two-gate approach
 
-**Decision:** When a domain is at its concurrency limit, the coroutine waits
-(`await semaphore.acquire()`) rather than pushing the job back to Redis and moving on.
+**Decision:** When a domain is at its concurrency limit, the coroutine waits rather than
+re-enqueueing the job.
 
-**Why:** The alternative (re-enqueue) has a safety hole — the job is already popped from Redis
-when we discover the domain is busy. Between the pop and the re-enqueue, if the process crashes,
-the job is silently lost. Waiting avoids this: the job stays claimed by the coroutine, Postgres
-already has it in `RUNNING` state, and recovery is straightforward.
+**Why:** Re-enqueue has a safety hole — the job is already popped from Redis when we discover the
+domain is busy. If the process crashes between pop and re-enqueue, the job is silently lost.
+Waiting avoids this: the job stays claimed by the coroutine and Postgres already has it in
+`RUNNING` state.
 
-The wait is not expensive — a suspended coroutine releases the event loop immediately. Other
-coroutines (on different domains) keep running normally. The only downside is that if all M
-coroutines happen to be waiting on the same domain, no new jobs get popped. This is mitigated by
-setting M high enough relative to your domain diversity, and addressed properly with priority
-queues in a later phase if needed.
+Two gates enforce the cap at different scopes:
 
-Domain semaphores are local (in-process) `asyncio.Semaphore` objects, keyed by hostname.
+**Gate 1 — local `asyncio.Semaphore` (in-process):**
+Prevents any single worker process from exceeding `MAX_CONCURRENCY_PER_DOMAIN` on its own.
+Fast — no network round-trip. Coroutine suspends here if the process is already at the cap,
+freeing the event loop to run other coroutines on different domains.
 
-**Current implementation (phase 2):** only the local `asyncio.Semaphore` is in place. This works
-correctly with a single worker process. With N worker containers, each process has its own
-semaphore, so the effective per-domain concurrency becomes `N × MAX_CONCURRENCY_PER_DOMAIN`
-rather than the intended cap. Running `docker-compose up --scale worker=3` with a cap of 3 would
-allow 9 simultaneous requests to the same domain.
-
-**Planned (spec 3):** a Redis `INCR`/`DECR` counter with TTL will be added as a cross-process
-gate. The local semaphore remains as a fast in-process first check; the Redis counter enforces the
-global cap across all worker processes.
+**Gate 2 — Redis counter (cross-process):**
+Enforces the global cap across all N worker containers. Uses a Lua script to atomically
+increment and check the counter so no two workers can race past the limit. A TTL of
+`fetch_timeout × 2` auto-releases the slot if a worker crashes without decrementing.
+If Redis says the domain is at capacity, the coroutine polls every 1s until a slot is free.
 
 ```python
-# per-process, per-domain
-domain_semaphores: dict[str, asyncio.Semaphore] = {}
-
-def get_semaphore(domain: str) -> asyncio.Semaphore:
-    if domain not in domain_semaphores:
-        domain_semaphores[domain] = asyncio.Semaphore(MAX_CONCURRENCY_PER_DOMAIN)
-    return domain_semaphores[domain]
+async with local_semaphore[domain]:              # gate 1 — in-process
+    while not await acquire_domain_slot(domain): # gate 2 — cross-process
+        await asyncio.sleep(1)
+    try:
+        ... process job ...
+    finally:
+        await release_domain_slot(domain)
 ```
+
+The `release_domain_slot` call is in a `finally` block — the Redis counter is always decremented
+even if the job fails or raises unexpectedly. A guard in `release_domain_slot` also resets the
+counter if it drifts below zero (e.g. from a double-release edge case).
 
 ---
 
@@ -165,38 +164,38 @@ worker processes).
 
 ### Worker pool
 
-N worker processes, each running M coroutines. Every coroutine runs this loop:
+N worker processes, each running M coroutines. A background `_queue_depth_poller` coroutine
+updates the Prometheus queue depth gauge every 15s. Every job coroutine runs this loop:
 
 ```python
-async def coroutine_worker(worker_id: str, semaphores: dict):
+async def coroutine_worker(...):
     while True:
-        raw = await redis.brpop(QUEUE_KEY, timeout=5)
+        raw = await redis.brpop(QUEUE_KEY, timeout=BRPOP_TIMEOUT)
         if raw is None:
             continue
 
-        job = parse_job(raw)
-        domain = extract_domain(job.url)
-        semaphore = get_or_create_semaphore(semaphores, domain)
+        job = await get_job(pool, job_id)
+        domain = urlparse(job.url).hostname
 
-        async with semaphore:
-            await update_status(job.id, "RUNNING", worker_id)
+        async with local_semaphore[domain]:          # gate 1 — in-process
+            while not await acquire_domain_slot(...): # gate 2 — cross-process Redis
+                await asyncio.sleep(1)
+
             try:
-                html = await fetch(job.url)
-                key  = await upload_html(html, job.id)
-                data = parse(html)
-                await mark_done(job.id, key, data)
+                active_jobs.inc()
+                html = await fetch_url(http_client, job.url)
+                key  = await upload_html(s3, html, job.id)
+                data = parse_html(html, job.url)      # extracts title/links/word_count/image_urls
+                image_keys = await upload_images(s3, http_client, data.pop("image_urls"), job.id)
+                data["image_keys"] = image_keys
+                await mark_job_done(pool, job.id, key, data)
             except RetryableError as e:
-                await handle_retry(job, e)
+                await _handle_retry(...)
             except FatalError as e:
-                await mark_dead(job.id, str(e))
-
-
-async def run_worker(worker_id: str):
-    semaphores: dict[str, asyncio.Semaphore] = {}
-    await asyncio.gather(*[
-        coroutine_worker(worker_id, semaphores)
-        for _ in range(WORKER_CONCURRENCY)
-    ])
+                await mark_job_dead(...)
+            finally:
+                active_jobs.dec()
+                await release_domain_slot(...)
 ```
 
 ### PostgreSQL
@@ -330,17 +329,21 @@ GET /internal/health
 ```python
 BACKOFF = [5, 25, 125]  # seconds
 
-async def handle_retry(job, error):
+async def _handle_retry(pool, redis_client, job, error_msg, worker_id):
     if job.retries >= job.max_retries:
-        await mark_dead(job.id, str(error))
+        await mark_job_dead(pool, job.id, error_msg)
     else:
-        delay = BACKOFF[job.retries]
-        await mark_failed_for_retry(job.id, str(error), delay)
-        # re-enqueued by the delayed retry scheduler (phase 3)
+        delay = BACKOFF[min(job.retries, len(BACKOFF) - 1)]
+        await mark_job_pending_retry(pool, job.id, error_msg, next_retry_at)
+        asyncio.create_task(_delayed_reenqueue(redis_client, pool, job.id, delay))
 ```
 
-Retryable: connection timeout, 429, 500, 503.
-Fatal: 404, 403, malformed URL, unparseable HTML.
+`_delayed_reenqueue` sleeps for `delay` seconds, resets status to `PENDING`, then pushes the
+job back to Redis. This is a phase 2 in-process implementation — if the worker crashes during
+the sleep the retry is lost. Phase 3 replaces this with a durable Redis `ZADD` sorted set.
+
+Retryable: connection timeout, 429, 500, 502, 503.
+Fatal: 404, 403, 410, any other 4xx/5xx, unparseable HTML.
 
 ---
 
@@ -353,10 +356,60 @@ Fatal: 404, 403, malformed URL, unparseable HTML.
 | `QUEUE_DEPTH_LIMIT`         | `10000` | API rejects submissions above this |
 | `BRPOP_TIMEOUT`             | `5`     | Seconds a coroutine blocks waiting for work |
 | `FETCH_TIMEOUT`             | `15`    | HTTP request timeout in seconds |
+| `METRICS_PORT`              | `9090`  | Prometheus metrics HTTP server port (worker) |
 | `DATABASE_URL`              | —       | asyncpg connection string |
 | `REDIS_URL`                 | —       | Redis connection string |
 | `S3_ENDPOINT_URL`           | —       | MinIO endpoint (omit for real AWS S3) |
-| `S3_BUCKET`                 | —       | Bucket name for raw HTML |
+| `S3_BUCKET`                 | —       | Bucket name for raw HTML and images |
+| `S3_ACCESS_KEY`             | —       | MinIO / S3 access key |
+| `S3_SECRET_KEY`             | —       | MinIO / S3 secret key |
+
+---
+
+## Logging
+
+Structured JSON line logging via `app/logging_config.py`. Called once at process start from
+`main.py` (API) and `worker.py` (worker).
+
+| Handler | Level | Destination |
+|---------|-------|-------------|
+| `RotatingFileHandler` | INFO | `logs/app.log`, rotates at 10 MB, keeps 5 backups |
+| `StreamHandler` | WARNING | stdout/stderr |
+
+Every log line is a JSON object with at minimum `ts`, `level`, `logger`, `msg`. Context fields
+are passed via `extra={}` and appear flat in the JSON:
+
+```json
+{"ts": "2026-05-16T10:00:00Z", "level": "INFO", "logger": "app.worker", "msg": "job done", "job_id": "...", "total_ms": 423}
+```
+
+Noisy library loggers (`asyncpg`, `httpx`, `boto3`, etc.) are set to WARNING to prevent
+log noise.
+
+---
+
+## Prometheus metrics
+
+The API mounts a `/metrics` endpoint via `prometheus_client.make_asgi_app()`. The worker runs
+a separate `start_http_server(METRICS_PORT)` in a background thread (default port 9090).
+Prometheus scrapes both every 15 seconds.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `scraper_jobs_total{status}` | Counter | Jobs by final status: `done`, `retried`, `dead` |
+| `scraper_jobs_enqueued_total` | Counter | Jobs submitted via the API |
+| `scraper_job_duration_seconds` | Histogram | End-to-end job processing time |
+| `scraper_fetch_duration_seconds` | Histogram | HTTP fetch duration per job |
+| `scraper_domain_wait_seconds` | Histogram | Time waiting for a domain concurrency slot |
+| `scraper_queue_depth` | Gauge | Current Redis queue depth (polled every 15s) |
+| `scraper_active_jobs` | Gauge | Jobs currently being processed |
+
+Grafana datasource is auto-provisioned via
+`monitoring/grafana/provisioning/datasources/prometheus.yml`.
+
+**Note:** running multiple worker containers with the current static scrape target
+(`worker:9090`) means Prometheus only scrapes one worker (DNS round-robin). Docker SD
+is deferred — see phase 3.
 
 ---
 
@@ -379,7 +432,7 @@ then N when M hits diminishing returns (CPU-bound HTML parsing becomes the bottl
 
 | Phase | What gets built |
 |---|---|
-| 1 | docker-compose (Postgres + Redis + MinIO), DB schema, migrations |
-| 2 | Async worker — M coroutines, domain semaphore, basic retry, FastAPI routes |
-| 3 | Delayed retry queue (Redis `ZADD` sorted set by timestamp), Redis cross-process domain counter, `'retried'` job event |
-| 4 | Prometheus `/metrics`, queue depth alerts, worker heartbeat |
+| ✅ 1 | docker-compose (Postgres + Redis + MinIO), DB schema, migrations |
+| ✅ 2 | Async worker — M coroutines, two-gate domain lock (local + Redis), basic retry, FastAPI routes, structured logging, image scraping |
+| 3 | Delayed retry queue (Redis `ZADD` sorted set by timestamp), `'retried'` job event, Docker SD for multi-worker Prometheus scraping |
+| ✅ 4 | Prometheus `/metrics` on API + worker, queue depth gauge, job counters/histograms, Grafana + Prometheus in docker-compose |

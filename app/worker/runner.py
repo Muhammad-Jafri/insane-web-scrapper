@@ -22,6 +22,15 @@ from app.db.queries import (
     mark_job_pending_retry,
     update_job_running,
 )
+from app.metrics import (
+    active_jobs,
+    domain_wait_seconds,
+    fetch_duration_seconds,
+    job_duration_seconds,
+    jobs_total,
+    queue_depth,
+)
+from app.worker.domain_lock import acquire_domain_slot, release_domain_slot
 from app.worker.errors import FatalError, RetryableError
 from app.worker.fetch import fetch_url
 from app.worker.parse import parse_html
@@ -115,88 +124,115 @@ async def _coroutine_worker(
 
             t_sem = time.monotonic()
             async with domain_semaphores[domain]:
-                sem_wait_ms = round((time.monotonic() - t_sem) * 1000)
-                if sem_wait_ms > 100:
+                sem_wait = time.monotonic() - t_sem
+                domain_wait_seconds.observe(sem_wait)
+                if sem_wait > 0.1:
                     logger.warning(
                         "domain semaphore wait",
-                        extra={"domain": domain, "wait_ms": sem_wait_ms, "cid": cid},
+                        extra={
+                            "domain": domain,
+                            "wait_ms": round(sem_wait * 1000),
+                            "cid": cid,
+                        },
                     )
 
-                await update_job_running(pool, job_id, worker_id)
-                await insert_job_event(pool, job_id, "started", worker_id)
+                # cross-process Redis gate — poll until a global slot is free
+                while not await acquire_domain_slot(redis_client, domain):
+                    logger.warning(
+                        "redis domain slot at capacity — waiting",
+                        extra={"domain": domain, "cid": cid},
+                    )
+                    await asyncio.sleep(1)
 
                 try:
-                    t0 = time.monotonic()
-                    html = await fetch_url(http_client, job["url"])
-                    logger.info(
-                        "fetch complete",
-                        extra={
-                            "job_id": str(job_id),
-                            "duration_ms": round((time.monotonic() - t0) * 1000),
-                        },
-                    )
+                    active_jobs.inc()
+                    await update_job_running(pool, job_id, worker_id)
+                    await insert_job_event(pool, job_id, "started", worker_id)
 
-                    key = await upload_html(s3_client, html, job_id)
+                    try:
+                        t0 = time.monotonic()
+                        html = await fetch_url(http_client, job["url"])
+                        fetch_dur = time.monotonic() - t0
+                        fetch_duration_seconds.observe(fetch_dur)
+                        logger.info(
+                            "fetch complete",
+                            extra={
+                                "job_id": str(job_id),
+                                "duration_ms": round(fetch_dur * 1000),
+                            },
+                        )
 
-                    data = parse_html(html, job["url"])
-                    image_urls = data.pop("image_urls")
-                    logger.info(
-                        "parse complete",
-                        extra={
-                            "job_id": str(job_id),
-                            "title": data["title"],
-                            "word_count": data["word_count"],
-                            "image_count": len(image_urls),
-                        },
-                    )
+                        key = await upload_html(s3_client, html, job_id)
 
-                    image_keys = await upload_images(
-                        s3_client, http_client, image_urls, job_id
-                    )
-                    data["image_keys"] = image_keys
-                    logger.info(
-                        "upload complete",
-                        extra={
-                            "job_id": str(job_id),
-                            "html_key": key,
-                            "images_uploaded": len(image_keys),
-                        },
-                    )
+                        data = parse_html(html, job["url"])
+                        image_urls = data.pop("image_urls")
+                        logger.info(
+                            "parse complete",
+                            extra={
+                                "job_id": str(job_id),
+                                "title": data["title"],
+                                "word_count": data["word_count"],
+                                "image_count": len(image_urls),
+                            },
+                        )
 
-                    await mark_job_done(pool, job_id, key, data)
-                    await insert_job_event(pool, job_id, "completed", worker_id)
-                    logger.info(
-                        "job done",
-                        extra={
-                            "job_id": str(job_id),
-                            "total_ms": round((time.monotonic() - t_start) * 1000),
-                        },
-                    )
+                        image_keys = await upload_images(
+                            s3_client, http_client, image_urls, job_id
+                        )
+                        data["image_keys"] = image_keys
+                        logger.info(
+                            "upload complete",
+                            extra={
+                                "job_id": str(job_id),
+                                "html_key": key,
+                                "images_uploaded": len(image_keys),
+                            },
+                        )
 
-                except RetryableError as e:
-                    await _handle_retry(pool, redis_client, job, str(e), worker_id)
+                        await mark_job_done(pool, job_id, key, data)
+                        await insert_job_event(pool, job_id, "completed", worker_id)
+                        total_dur = time.monotonic() - t_start
+                        job_duration_seconds.observe(total_dur)
+                        jobs_total.labels(status="done").inc()
+                        logger.info(
+                            "job done",
+                            extra={
+                                "job_id": str(job_id),
+                                "total_ms": round(total_dur * 1000),
+                            },
+                        )
 
-                except FatalError as e:
-                    await mark_job_dead(pool, job_id, str(e))
-                    await insert_job_event(pool, job_id, "dead", worker_id, str(e))
-                    logger.warning(
-                        "job dead — fatal error",
-                        extra={
-                            "job_id": str(job_id),
-                            "url": job["url"],
-                            "error": str(e),
-                        },
-                    )
+                    except RetryableError as e:
+                        jobs_total.labels(status="retried").inc()
+                        await _handle_retry(pool, redis_client, job, str(e), worker_id)
 
-                except Exception as e:
-                    logger.error(
-                        "unexpected error processing job",
-                        extra={"job_id": str(job_id), "url": job["url"]},
-                        exc_info=True,
-                    )
-                    await _handle_retry(
-                        pool, redis_client, job, f"Unexpected: {e}", worker_id
-                    )
+                    except FatalError as e:
+                        jobs_total.labels(status="dead").inc()
+                        await mark_job_dead(pool, job_id, str(e))
+                        await insert_job_event(pool, job_id, "dead", worker_id, str(e))
+                        logger.warning(
+                            "job dead — fatal error",
+                            extra={
+                                "job_id": str(job_id),
+                                "url": job["url"],
+                                "error": str(e),
+                            },
+                        )
+
+                    except Exception as e:
+                        jobs_total.labels(status="retried").inc()
+                        logger.error(
+                            "unexpected error processing job",
+                            extra={"job_id": str(job_id), "url": job["url"]},
+                            exc_info=True,
+                        )
+                        await _handle_retry(
+                            pool, redis_client, job, f"Unexpected: {e}", worker_id
+                        )
+
+                finally:
+                    active_jobs.dec()
+                    await release_domain_slot(redis_client, domain)
 
         except Exception as e:
             logger.error(
@@ -207,7 +243,19 @@ async def _coroutine_worker(
             await asyncio.sleep(1)
 
 
+async def _queue_depth_poller(redis_client) -> None:
+    while True:
+        try:
+            depth = await redis_client.llen(QUEUE_KEY)
+            queue_depth.set(depth)
+        except Exception:
+            pass
+        await asyncio.sleep(15)
+
+
 async def run_worker() -> None:
+    from prometheus_client import start_http_server
+
     worker_id = f"worker-{os.getpid()}"
     pool = await create_pool()
     redis_client = aioredis.from_url(settings.redis_url)
@@ -215,15 +263,21 @@ async def run_worker() -> None:
 
     await ensure_bucket(s3_client)
 
-    domain_semaphores: dict[str, asyncio.Semaphore] = {}
-
+    start_http_server(settings.metrics_port)
     logger.info(
         "worker starting",
-        extra={"worker_id": worker_id, "concurrency": settings.worker_concurrency},
+        extra={
+            "worker_id": worker_id,
+            "concurrency": settings.worker_concurrency,
+            "metrics_port": settings.metrics_port,
+        },
     )
+
+    domain_semaphores: dict[str, asyncio.Semaphore] = {}
 
     async with httpx.AsyncClient(timeout=settings.fetch_timeout) as http_client:
         await asyncio.gather(
+            _queue_depth_poller(redis_client),
             *[
                 _coroutine_worker(
                     i,
@@ -235,7 +289,7 @@ async def run_worker() -> None:
                     domain_semaphores,
                 )
                 for i in range(settings.worker_concurrency)
-            ]
+            ],
         )
 
     await pool.close()
