@@ -4,9 +4,7 @@ import logging.handlers
 import os
 from datetime import datetime, timezone
 
-_LOG_FILE = "logs/app.log"
-_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
-_BACKUP_COUNT = 5
+from app.config import settings
 
 _STANDARD_ATTRS = frozenset(
     {
@@ -53,23 +51,23 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(out, default=str)
 
 
-def setup_logging() -> None:
-    os.makedirs("logs", exist_ok=True)
+def setup_logging(log_dir: str = "logs", filename: str = "app.log") -> None:
+    os.makedirs(log_dir, exist_ok=True)
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
     file_handler = logging.handlers.RotatingFileHandler(
-        _LOG_FILE,
-        maxBytes=_MAX_BYTES,
-        backupCount=_BACKUP_COUNT,
+        os.path.join(log_dir, filename),
+        maxBytes=settings.log_max_bytes,
+        backupCount=settings.log_backup_count,
         encoding="utf-8",
     )
-    file_handler.setLevel(logging.INFO)
+    file_handler.setLevel(logging.WARNING)
     file_handler.setFormatter(_JsonFormatter())
 
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)
+    console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(_JsonFormatter())
 
     root.addHandler(file_handler)

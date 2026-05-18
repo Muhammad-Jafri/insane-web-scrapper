@@ -165,7 +165,7 @@ worker processes).
 ### Worker pool
 
 N worker processes, each running M coroutines. A background `_queue_depth_poller` coroutine
-updates the Prometheus queue depth gauge every 15s. Every job coroutine runs this loop:
+updates the Prometheus queue depth gauge every 5s. Every job coroutine runs this loop:
 
 ```python
 async def coroutine_worker(...):
@@ -392,7 +392,7 @@ log noise.
 
 The API mounts a `/metrics` endpoint via `prometheus_client.make_asgi_app()`. The worker runs
 a separate `start_http_server(METRICS_PORT)` in a background thread (default port 9090).
-Prometheus scrapes both every 15 seconds.
+Prometheus scrapes both every 5 seconds.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -401,15 +401,17 @@ Prometheus scrapes both every 15 seconds.
 | `scraper_job_duration_seconds` | Histogram | End-to-end job processing time |
 | `scraper_fetch_duration_seconds` | Histogram | HTTP fetch duration per job |
 | `scraper_domain_wait_seconds` | Histogram | Time waiting for a domain concurrency slot |
-| `scraper_queue_depth` | Gauge | Current Redis queue depth (polled every 15s) |
+| `scraper_queue_depth` | Gauge | Current Redis queue depth (polled every 5s) |
 | `scraper_active_jobs` | Gauge | Jobs currently being processed |
 
 Grafana datasource and dashboard are both auto-provisioned on container start via files in
 `monitoring/grafana/provisioning/`.
 
-**Note:** running multiple worker containers with the current static scrape target
-(`worker:9090`) means Prometheus only scrapes one worker (DNS round-robin). Docker SD
-is deferred — see phase 3.
+**Multi-worker scraping:** Prometheus uses Docker SD (`docker_sd_configs` with
+`unix:///var/run/docker.sock`) to auto-discover all running worker containers. Targets
+are filtered by the `com.docker.compose.service=worker` label and each container's
+hostname is used as the `instance` label. No config change is needed when scaling N up
+or down.
 
 ### Grafana dashboard — panels
 
@@ -450,14 +452,16 @@ Dashboard uid: `scraper-main`. Auto-refreshes every 10s. Layout is a 24-column g
 
 | Knob | What it controls |
 |---|---|
+| `NUM_WORKERS` (N) | Number of worker containers (`deploy.replicas` in docker-compose) |
+| `WORKER_CONCURRENCY` (M) | Coroutines per worker process — tune for network latency |
+| `MAX_CONCURRENCY_PER_DOMAIN` | Politeness cap per hostname (local + Redis gate) |
 | API instances | HTTP read/write throughput |
-| Worker processes (N) | Parallelism across CPU cores; also multiplies total coroutines |
-| `WORKER_CONCURRENCY` (M) | In-flight jobs per process — tune for network latency |
-| `MAX_CONCURRENCY_PER_DOMAIN` | Politeness cap per hostname |
 | `QUEUE_DEPTH_LIMIT` | Backpressure at the API layer |
 
-Total concurrent in-flight fetches = N processes × M coroutines. Scale M first (cheap),
-then N when M hits diminishing returns (CPU-bound HTML parsing becomes the bottleneck).
+Total concurrent in-flight fetches = N containers × M coroutines. Scale M first (cheap,
+no extra Postgres connections), then N when M hits diminishing returns (CPU-bound HTML
+parsing becomes the bottleneck). Each container is identified by its Docker hostname
+(`socket.gethostname()`) in logs and job events.
 
 ---
 
@@ -467,5 +471,6 @@ then N when M hits diminishing returns (CPU-bound HTML parsing becomes the bottl
 |---|---|
 | ✅ 1 | docker-compose (Postgres + Redis + MinIO), DB schema, migrations |
 | ✅ 2 | Async worker — M coroutines, two-gate domain lock (local + Redis), basic retry, FastAPI routes, structured logging, image scraping |
-| 3 | Delayed retry queue (Redis `ZADD` sorted set by timestamp), `'retried'` job event, Docker SD for multi-worker Prometheus scraping |
+| ✅ 3 (partial) | Docker SD for multi-worker Prometheus scraping, `NUM_WORKERS` horizontal scaling via `deploy.replicas` |
+| 3 (remaining) | Delayed retry queue (Redis `ZADD` sorted set by timestamp), `'retried'` job event |
 | ✅ 4 | Prometheus `/metrics` on API + worker, queue depth gauge, job counters/histograms, Grafana + Prometheus in docker-compose |

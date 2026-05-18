@@ -250,7 +250,7 @@ async def _queue_depth_poller(redis_client) -> None:
             queue_depth.set(depth)
         except Exception:
             pass
-        await asyncio.sleep(15)
+        await asyncio.sleep(5)
 
 
 async def run_worker() -> None:

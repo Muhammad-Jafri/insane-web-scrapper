@@ -51,6 +51,8 @@ services:
     env_file: .env
     ports:
       - "8000:8000"
+    volumes:
+      - ./logs/api:/app/logs/api
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,6 +70,8 @@ services:
     env_file: .env
     expose:
       - "9090"
+    volumes:
+      - ./logs/worker:/app/logs/worker
     deploy:
       replicas: ${NUM_WORKERS:-1}
     depends_on:

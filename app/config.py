@@ -18,5 +18,8 @@ class Settings(BaseSettings):
     fetch_timeout: int = 15
     metrics_port: int = 9090
 
+    log_max_bytes: int = 10 * 1024 * 1024  # 10 MB
+    log_backup_count: int = 5
+
 
 settings = Settings()
