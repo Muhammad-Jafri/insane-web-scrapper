@@ -357,6 +357,8 @@ Fatal: 404, 403, 410, any other 4xx/5xx, unparseable HTML.
 | `BRPOP_TIMEOUT`             | `5`     | Seconds a coroutine blocks waiting for work |
 | `FETCH_TIMEOUT`             | `15`    | HTTP request timeout in seconds |
 | `METRICS_PORT`              | `9090`  | Prometheus metrics HTTP server port (worker) |
+| `LOG_MAX_BYTES`             | `10485760` | Rotating log file size threshold (10 MB) |
+| `LOG_BACKUP_COUNT`          | `5`     | Number of rotated log files to retain |
 | `DATABASE_URL`              | —       | asyncpg connection string |
 | `REDIS_URL`                 | —       | Redis connection string |
 | `S3_ENDPOINT_URL`           | —       | MinIO endpoint (omit for real AWS S3) |
@@ -369,18 +371,33 @@ Fatal: 404, 403, 410, any other 4xx/5xx, unparseable HTML.
 ## Logging
 
 Structured JSON line logging via `app/logging_config.py`. Called once at process start from
-`main.py` (API) and `worker.py` (worker).
+`main.py` (API) and `worker.py` (worker), each passing a service-specific log directory.
 
 | Handler | Level | Destination |
 |---------|-------|-------------|
-| `RotatingFileHandler` | INFO | `logs/app.log`, rotates at 10 MB, keeps 5 backups |
-| `StreamHandler` | WARNING | stdout/stderr |
+| `RotatingFileHandler` | WARNING | host-mounted path, rotates at `LOG_MAX_BYTES`, keeps `LOG_BACKUP_COUNT` backups |
+| `StreamHandler` | INFO | stdout/stderr (`docker compose logs`) |
+
+**File layout on the host:**
+```
+./logs/
+  api/
+    app.log
+    app.log.1  ...
+  worker/
+    <hostname>.log       ← one file per replica, named by container hostname
+    <hostname>.log.1  ...
+```
+
+Worker log files are named by `socket.gethostname()` so N replicas never collide.
+Files are bind-mounted via docker-compose (`./logs/api:/app/logs/api`, `./logs/worker:/app/logs/worker`)
+and persist across container restarts.
 
 Every log line is a JSON object with at minimum `ts`, `level`, `logger`, `msg`. Context fields
 are passed via `extra={}` and appear flat in the JSON:
 
 ```json
-{"ts": "2026-05-16T10:00:00Z", "level": "INFO", "logger": "app.worker", "msg": "job done", "job_id": "...", "total_ms": 423}
+{"ts": "2026-05-16T10:00:00Z", "level": "WARNING", "logger": "app.worker", "msg": "job failed — retry scheduled", "job_id": "...", "retry_num": 1}
 ```
 
 Noisy library loggers (`asyncpg`, `httpx`, `boto3`, etc.) are set to WARNING to prevent
