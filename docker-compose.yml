@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:890480b08124ce7f79960a9bb16fe39729aa302bd384bfd7c408fee6c8f7adb7
     environment:
       POSTGRES_DB: scraper
       POSTGRES_USER: scraper
@@ -16,7 +16,7 @@ services:
       retries: 5
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     ports:
       - "6379:6379"
     healthcheck:
@@ -26,7 +26,7 @@ services:
       retries: 5
 
   minio:
-    image: minio/minio:latest # TODO pin the image. 
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -86,7 +86,7 @@ services:
     restart: unless-stopped
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus@sha256:e4254400b85610324913f0dc4acf92603d9984e7519414c5a12811aa6146acc3
     ports:
       - "9091:9090"
     volumes:
@@ -97,7 +97,7 @@ services:
       - worker
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana@sha256:2d1f9ae67c1778d33e291d4c3c759cd8b650e67491f02533499eb950e075eeb5
     ports:
       - "3000:3000"
     volumes:

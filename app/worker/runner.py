@@ -11,7 +11,7 @@ import httpx
 import redis.asyncio as aioredis
 
 from app.config import settings
-from app.constants import BACKOFF, QUEUE_KEY
+from app.constants import BACKOFF, QUEUE_KEY, RETRY_QUEUE_KEY
 from app.db.pool import create_pool
 from app.db.queries import (
     get_job,
@@ -38,16 +38,18 @@ from app.worker.storage import ensure_bucket, make_s3_client, upload_html, uploa
 
 logger = logging.getLogger("app.worker")
 
-
-async def _delayed_reenqueue(
-    redis_client, pool: asyncpg.Pool, job_id: UUID, delay: int
-) -> None:
-    await asyncio.sleep(delay)
-    await mark_job_pending(pool, job_id)
-    await redis_client.rpush(QUEUE_KEY, str(job_id))
-    logger.info(
-        "job re-enqueued after backoff", extra={"job_id": str(job_id), "delay_s": delay}
-    )
+# Atomically pops all jobs whose retry timestamp has passed and pushes them
+# to the main queue.
+# Returns the list of job_id strings that were promoted.
+_LUA_PROMOTE_RETRY = """
+local ready = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)
+if #ready == 0 then return {} end
+redis.call('ZREM', KEYS[1], unpack(ready))
+for _, job_id in ipairs(ready) do
+    redis.call('RPUSH', KEYS[2], job_id)
+end
+return ready
+"""
 
 
 async def _handle_retry(
@@ -69,9 +71,11 @@ async def _handle_retry(
     delay = BACKOFF[min(job["retries"], len(BACKOFF) - 1)]
     next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
     await mark_job_pending_retry(pool, job["id"], error_msg, next_retry_at)
-    await insert_job_event(pool, job["id"], "failed", worker_id, error_msg)
+    await insert_job_event(pool, job["id"], "retried", worker_id, error_msg)
+    score = time.time() + delay  # Unix timestamp when job becomes eligible
+    await redis_client.zadd(RETRY_QUEUE_KEY, {str(job["id"]): score})
     logger.warning(
-        "job failed — retry scheduled",
+        "job failed — added to retry queue",
         extra={
             "job_id": str(job["id"]),
             "url": job["url"],
@@ -80,7 +84,23 @@ async def _handle_retry(
             "next_retry_s": delay,
         },
     )
-    asyncio.create_task(_delayed_reenqueue(redis_client, pool, job["id"], delay))
+
+
+async def _retry_queue_poller(pool: asyncpg.Pool, redis_client) -> None:
+    while True:
+        try:
+            ready = await redis_client.eval(
+                _LUA_PROMOTE_RETRY, 2, RETRY_QUEUE_KEY, QUEUE_KEY, time.time()
+            )
+            for job_id_bytes in ready:
+                job_id = UUID(job_id_bytes.decode())
+                await mark_job_pending(pool, job_id)
+                logger.info(
+                    "job promoted from retry queue", extra={"job_id": str(job_id)}
+                )
+        except Exception:
+            logger.error("retry queue poller error", exc_info=True)
+        await asyncio.sleep(1)
 
 
 async def _coroutine_worker(
@@ -278,6 +298,7 @@ async def run_worker() -> None:
     async with httpx.AsyncClient(timeout=settings.fetch_timeout) as http_client:
         await asyncio.gather(
             _queue_depth_poller(redis_client),
+            _retry_queue_poller(pool, redis_client),
             *[
                 _coroutine_worker(
                     i,

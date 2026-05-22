@@ -153,9 +153,15 @@ The API never touches scraper code. It knows nothing about HTTP fetching or HTML
 
 Two purposes:
 
-**Job queue** — a Redis `LIST`. Workers `BRPOP` from the left, API `RPUSH` to the right.
-FIFO by default. `BRPOP` is atomic — two coroutines (even across processes) cannot pop the
-same job.
+**Job queue** — a Redis `LIST` (`scraper:queue`). Workers `BRPOP` from the left, API `RPUSH`
+to the right. FIFO by default. `BRPOP` is atomic — two coroutines (even across processes)
+cannot pop the same job.
+
+**Retry queue** — a Redis `ZSET` (`scraper:retry_queue`) scored by Unix timestamp. When a
+retryable job fails, `_handle_retry` does a `ZADD` with score `time.time() + delay`. Every
+worker's `_retry_queue_poller` runs a Lua script each second that atomically pops all
+members with score ≤ `time.time()` and pushes them to the main queue. This survives worker
+crashes — any worker's poller will promote the job when its time comes.
 
 **Per-domain counter** — a Redis `STRING` with expiry used as a cross-process concurrency
 counter. Incremented before fetching, decremented after. Works in tandem with the local
@@ -164,8 +170,9 @@ worker processes).
 
 ### Worker pool
 
-N worker processes, each running M coroutines. A background `_queue_depth_poller` coroutine
-updates the Prometheus queue depth gauge every 5s. Every job coroutine runs this loop:
+N worker processes, each running M coroutines. Two background coroutines run alongside the job coroutines: `_queue_depth_poller` updates
+the Prometheus queue depth gauge every 5s; `_retry_queue_poller` promotes due retry jobs
+every 1s. Every job coroutine runs this loop:
 
 ```python
 async def coroutine_worker(...):
@@ -332,15 +339,40 @@ BACKOFF = [5, 25, 125]  # seconds
 async def _handle_retry(pool, redis_client, job, error_msg, worker_id):
     if job.retries >= job.max_retries:
         await mark_job_dead(pool, job.id, error_msg)
+        await insert_job_event(pool, job.id, "dead", worker_id, error_msg)
     else:
         delay = BACKOFF[min(job.retries, len(BACKOFF) - 1)]
         await mark_job_pending_retry(pool, job.id, error_msg, next_retry_at)
-        asyncio.create_task(_delayed_reenqueue(redis_client, pool, job.id, delay))
+        await insert_job_event(pool, job.id, "retried", worker_id, error_msg)
+        score = time.time() + delay  # Unix timestamp when job becomes eligible
+        await redis_client.zadd(RETRY_QUEUE_KEY, {str(job.id): score})
 ```
 
-`_delayed_reenqueue` sleeps for `delay` seconds, resets status to `PENDING`, then pushes the
-job back to Redis. This is a phase 2 in-process implementation — if the worker crashes during
-the sleep the retry is lost. Phase 3 replaces this with a durable Redis `ZADD` sorted set.
+`mark_job_pending_retry` sets `status = 'FAILED'`, increments `retries`, and records
+`next_retry_at`. The job then sits in `FAILED` state in Postgres and in the Redis sorted set
+`scraper:retry_queue` (scored by the Unix timestamp it becomes eligible).
+
+A background `_retry_queue_poller` coroutine runs inside every worker process and polls every
+1 second. It uses a Lua script to atomically pop all jobs whose score ≤ `time.time()` from the
+sorted set and push them directly to the main `scraper:queue` in one Redis round-trip. It then
+calls `mark_job_pending` for each promoted job.
+
+```lua
+-- _LUA_PROMOTE_RETRY: atomically promote ready jobs from sorted set to main queue
+local ready = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)
+if #ready == 0 then return {} end
+redis.call('ZREM', KEYS[1], unpack(ready))
+for _, job_id in ipairs(ready) do
+    redis.call('RPUSH', KEYS[2], job_id)
+end
+return ready
+```
+
+**Durability:** the retry record lives in Redis (persistent if AOF/RDB is enabled) and in the
+`next_retry_at` column in Postgres. If a worker crashes, another worker's `_retry_queue_poller`
+picks up the job when the timestamp passes. If Redis also dies, the job remains `FAILED` in
+Postgres with `next_retry_at` set and can be recovered by a reconciler that re-enqueues
+`FAILED` rows whose `next_retry_at` has passed (not yet implemented — out of scope).
 
 Retryable: connection timeout, 429, 500, 502, 503.
 Fatal: 404, 403, 410, any other 4xx/5xx, unparseable HTML.
@@ -397,7 +429,7 @@ Every log line is a JSON object with at minimum `ts`, `level`, `logger`, `msg`. 
 are passed via `extra={}` and appear flat in the JSON:
 
 ```json
-{"ts": "2026-05-16T10:00:00Z", "level": "WARNING", "logger": "app.worker", "msg": "job failed — retry scheduled", "job_id": "...", "retry_num": 1}
+{"ts": "2026-05-16T10:00:00Z", "level": "WARNING", "logger": "app.worker", "msg": "job failed — added to retry queue", "job_id": "...", "retry_num": 1, "next_retry_s": 5}
 ```
 
 Noisy library loggers (`asyncpg`, `httpx`, `boto3`, etc.) are set to WARNING to prevent
@@ -417,7 +449,7 @@ Prometheus scrapes both every 5 seconds.
 | `scraper_jobs_enqueued_total` | Counter | Jobs submitted via the API |
 | `scraper_job_duration_seconds` | Histogram | End-to-end job processing time |
 | `scraper_fetch_duration_seconds` | Histogram | HTTP fetch duration per job |
-| `scraper_domain_wait_seconds` | Histogram | Time waiting for a domain concurrency slot |
+| `scraper_domain_wait_seconds` | Histogram | Time waiting for the local `asyncio.Semaphore` (gate 1 only) |
 | `scraper_queue_depth` | Gauge | Current Redis queue depth (polled every 5s) |
 | `scraper_active_jobs` | Gauge | Jobs currently being processed |
 
@@ -426,13 +458,14 @@ Grafana datasource and dashboard are both auto-provisioned on container start vi
 
 **Multi-worker scraping:** Prometheus uses Docker SD (`docker_sd_configs` with
 `unix:///var/run/docker.sock`) to auto-discover all running worker containers. Targets
-are filtered by the `com.docker.compose.service=worker` label and each container's
-hostname is used as the `instance` label. No config change is needed when scaling N up
-or down.
+are filtered by the `com.docker.compose.service=worker` label. The `instance` label is
+set from `__meta_docker_container_name` (e.g. `insane-web-scrapper-worker-1`), which
+differs from the container's `socket.gethostname()` used in logs and job events. No
+config change is needed when scaling N up or down.
 
 ### Grafana dashboard — panels
 
-Dashboard uid: `scraper-main`. Auto-refreshes every 10s. Layout is a 24-column grid.
+Dashboard uid: `scraper-main`. Auto-refreshes every 5s. Layout is a 24-column grid.
 
 **Row 1 — Overview stats (h=4)**
 
@@ -488,6 +521,5 @@ parsing becomes the bottleneck). Each container is identified by its Docker host
 |---|---|
 | ✅ 1 | docker-compose (Postgres + Redis + MinIO), DB schema, migrations |
 | ✅ 2 | Async worker — M coroutines, two-gate domain lock (local + Redis), basic retry, FastAPI routes, structured logging, image scraping |
-| ✅ 3 (partial) | Docker SD for multi-worker Prometheus scraping, `NUM_WORKERS` horizontal scaling via `deploy.replicas` |
-| 3 (remaining) | Delayed retry queue (Redis `ZADD` sorted set by timestamp), `'retried'` job event |
+| ✅ 3 | Docker SD for multi-worker Prometheus scraping, `NUM_WORKERS` horizontal scaling via `deploy.replicas`, durable retry queue (Redis `ZADD` sorted set + `_retry_queue_poller`), `'retried'` job event |
 | ✅ 4 | Prometheus `/metrics` on API + worker, queue depth gauge, job counters/histograms, Grafana + Prometheus in docker-compose |
