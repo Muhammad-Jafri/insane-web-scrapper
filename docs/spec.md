@@ -99,24 +99,30 @@ counter if it drifts below zero (e.g. from a double-release edge case).
 
 ---
 
-### 4. S3 via boto3 + asyncio.to_thread
+### 4. Blocking work via asyncio.to_thread
 
-**Decision:** Use the standard `boto3` library wrapped in `asyncio.to_thread()` rather than
-`aioboto3`.
+**Decision:** Any synchronous, blocking work is offloaded with `asyncio.to_thread()` rather
+than called directly in the event loop.
 
-**Why:** `aioboto3` is a thin community wrapper around `boto3` that lags behind on releases and
-adds a dependency with a small maintenance surface. `asyncio.to_thread` offloads the blocking
-boto3 call to the default thread pool — the event loop is not blocked and continues running other
-coroutines while the upload happens in a thread.
+Two operations fall into this category:
 
-This is not truly non-blocking at the OS level (a thread is still sitting waiting on the socket),
-but it is non-blocking from the event loop's perspective, which is what matters. At realistic
-concurrency (10–20 simultaneous uploads), the default thread pool size
-(`min(32, cpu_count + 4)`) is never a bottleneck.
+**S3 uploads (`boto3`):** `aioboto3` is a thin community wrapper that lags behind on releases.
+`asyncio.to_thread` offloads the blocking boto3 call to the default thread pool — the event
+loop continues running other coroutines while the upload waits on the socket in a thread.
+
+**HTML parsing (`BeautifulSoup`):** Parsing is CPU-bound, not I/O-bound, but the effect on
+the event loop is identical — the thread is occupied and all other coroutines in the process
+stall until it returns. Wrapping it in `asyncio.to_thread` frees the event loop to schedule
+other coroutines during parsing. `parse_html` has no shared mutable state so concurrent
+execution across threads is safe.
 
 ```python
 await asyncio.to_thread(s3_client.put_object, Bucket=bucket, Key=key, Body=html)
+data = await asyncio.to_thread(parse_html, html, job["url"])
 ```
+
+At realistic concurrency (10–20 coroutines), the default thread pool size
+(`min(32, cpu_count + 4)`) is never a bottleneck for either operation.
 
 ---
 
@@ -130,10 +136,12 @@ await asyncio.to_thread(s3_client.put_object, Bucket=bucket, Key=key, Body=html)
 | PostgreSQL  | `asyncpg`       | Fastest async Postgres driver for Python, binary protocol |
 | Redis       | `redis.asyncio` | Official async support in the redis-py package, no extra dep |
 | S3 / MinIO  | `boto3` + `asyncio.to_thread` | See decision 4 above |
+| HTML parse  | `BeautifulSoup` + `asyncio.to_thread` | See decision 4 above |
 
-Unlike `boto3`, these libraries expose proper `async/await` interfaces — no thread is spawned,
-the event loop handles the socket directly via epoll/selectors. This is the right model for
-operations that happen on every job (HTTP fetch, DB write) where spawning threads would add up.
+Unlike `boto3`/BeautifulSoup, these libraries expose proper `async/await` interfaces — no
+thread is spawned, the event loop handles the socket directly via epoll/selectors. This is
+the right model for operations that happen on every job (HTTP fetch, DB write) where
+spawning threads would add up.
 
 ---
 

@@ -184,7 +184,7 @@ async def _coroutine_worker(
 
                         key = await upload_html(s3_client, html, job_id)
 
-                        data = parse_html(html, job["url"])
+                        data = await asyncio.to_thread(parse_html, html, job["url"])
                         image_urls = data.pop("image_urls")
                         logger.info(
                             "parse complete",
